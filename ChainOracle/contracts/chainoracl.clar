@@ -1,4 +1,4 @@
-;; Cross-Chain Price Aggregator
+;; ChainOracle: Cross-Chain Price Aggregator
 ;; Provides reliable price feeds from multiple chains with built-in security features
 
 ;; Constants for configuration
@@ -49,6 +49,13 @@
     }
 )
 
+;; Helper function for absolute difference
+(define-private (calculate-abs-difference (a uint) (b uint))
+    (if (>= a b)
+        (- a b)
+        (- b a))
+)
+
 ;; Administrative Functions
 
 (define-public (set-authorized-provider (provider principal) (authorized bool))
@@ -78,7 +85,7 @@
 ;; Price Submission and Updates
 
 (define-public (submit-price
-    (chain-id uint)
+    (target-chain-id uint)
     (price uint)
     (volume uint)
     (cross-chain-proof (optional (buff 64))))
@@ -87,75 +94,87 @@
         (provider-authorized (default-to false (map-get? authorized-providers tx-sender)))
     )
         (asserts! provider-authorized ERR-NOT-AUTHORIZED)
-        (asserts! (is-valid-chain chain-id) ERR-INVALID-CHAIN)
+        (asserts! (is-valid-chain target-chain-id) ERR-INVALID-CHAIN)
         (asserts! (>= volume (var-get min-volume-threshold)) ERR-BELOW-MIN-VOLUME)
-        (asserts! (is-valid-price-change chain-id price) ERR-HIGH-DEVIATION)
+        (asserts! (is-valid-price-change target-chain-id price) ERR-HIGH-DEVIATION)
         
         (map-set price-feeds
-            { chain-id: chain-id, source: tx-sender }
+            { chain-id: target-chain-id, source: tx-sender }
             {
                 price: price,
                 timestamp: current-time,
                 volume: volume,
                 weight: (get-source-weight tx-sender),
-                verified: (verify-cross-chain-proof chain-id price cross-chain-proof)
+                verified: (verify-cross-chain-proof target-chain-id price cross-chain-proof)
             }
         )
         
-        (update-price-history chain-id price current-time)
+        (update-price-history target-chain-id price current-time)
         (ok true)
     )
 )
 
 ;; Price Retrieval Functions
 
-(define-read-only (get-weighted-price (chain-id uint))
+(define-read-only (get-weighted-price (requested-chain-id uint))
     (let (
-        (valid-feeds (get-valid-price-feeds chain-id))
-        (total-weight (fold + u0 (map get-feed-weight valid-feeds)))
+        (feed-data (map-get? price-feeds { chain-id: requested-chain-id, source: tx-sender }))
     )
-        (asserts! (>= (len valid-feeds) (var-get min-required-sources)) ERR-INSUFFICIENT-SOURCES)
-        (ok (/ (fold + u0 (map calculate-weighted-price valid-feeds)) total-weight))
+        (match feed-data
+            feed (if (is-valid-feed (some feed))
+                    (ok (weighted-average feed))
+                    ERR-INVALID-PRICE)
+            ERR-INVALID-PRICE)
     )
 )
 
-(define-read-only (get-normalized-price (chain-id uint))
+(define-read-only (get-normalized-price (requested-chain-id uint))
     (let (
-        (weighted-price (unwrap! (get-weighted-price chain-id) ERR-INVALID-PRICE))
-        (volatility (get-volatility-index chain-id))
+        (weighted-price (unwrap! (get-weighted-price requested-chain-id) ERR-INVALID-PRICE))
+        (volatility (get-volatility-index requested-chain-id))
     )
         (ok (normalize-price weighted-price volatility))
     )
 )
 
-;; Helper Functions
-
-(define-private (is-valid-chain (chain-id uint))
-    (or (is-eq chain-id CHAIN-BTC)
-        (is-eq chain-id CHAIN-ETH)
-        (is-eq chain-id CHAIN-SOL))
+(define-private (weighted-average (feed {
+    price: uint,
+    timestamp: uint,
+    volume: uint,
+    weight: uint,
+    verified: bool
+}))
+    (* (get price feed) (get weight feed))
 )
 
-(define-private (is-valid-price-change (chain-id uint) (new-price uint))
+;; Helper Functions
+
+(define-private (is-valid-chain (target-chain-id uint))
+    (or (is-eq target-chain-id CHAIN-BTC)
+        (is-eq target-chain-id CHAIN-ETH)
+        (is-eq target-chain-id CHAIN-SOL))
+)
+
+(define-private (is-valid-price-change (target-chain-id uint) (new-price uint))
     (let (
         (history (default-to { last-price: u0, last-update: u0, volatility-index: u0 }
-            (map-get? price-history { chain-id: chain-id })))
+            (map-get? price-history { chain-id: target-chain-id })))
         (price-change (if (is-eq (get last-price history) u0)
             u0
-            (abs (- new-price (get last-price history)))))
+            (calculate-abs-difference new-price (get last-price history))))
         (max-allowed-change (* (get last-price history) (var-get max-price-deviation)))
     )
         (<= price-change max-allowed-change)
     )
 )
 
-(define-private (verify-cross-chain-proof (chain-id uint) (price uint) (proof (optional (buff 64))))
+(define-private (verify-cross-chain-proof (target-chain-id uint) (price uint) (proof (optional (buff 64))))
     (match proof
-        proof-value (verify-signature chain-id price proof-value)
+        proof-value (verify-signature target-chain-id price proof-value)
         true)
 )
 
-(define-private (verify-signature (chain-id uint) (price uint) (signature (buff 64)))
+(define-private (verify-signature (target-chain-id uint) (price uint) (signature (buff 64)))
     ;; Implementation would verify cross-chain signatures
     ;; This is a placeholder that would need chain-specific implementation
     true
@@ -164,11 +183,6 @@
 (define-private (get-source-weight (source principal))
     ;; Calculate weight based on source's historical accuracy and volume
     u50  ;; Default weight, would be dynamic in production
-)
-
-(define-private (get-valid-price-feeds (chain-id uint))
-    (filter is-valid-feed
-        (map-get? price-feeds { chain-id: chain-id, source: tx-sender }))
 )
 
 (define-private (is-valid-feed (feed (optional {
@@ -187,34 +201,24 @@
         false)
 )
 
-(define-private (calculate-weighted-price (feed {
-    price: uint,
-    timestamp: uint,
-    volume: uint,
-    weight: uint,
-    verified: bool
-}))
-    (* (get price feed) (get weight feed))
+(define-private (get-volatility-index (target-chain-id uint))
+    (let (
+        (history (default-to
+            { last-price: u0, last-update: u0, volatility-index: u0 }
+            (map-get? price-history { chain-id: target-chain-id })))
+    )
+        (get volatility-index history)
+    )
 )
 
-(define-private (get-feed-weight (feed {
-    price: uint,
-    timestamp: uint,
-    volume: uint,
-    weight: uint,
-    verified: bool
-}))
-    (get weight feed)
-)
-
-(define-private (update-price-history (chain-id uint) (price uint) (timestamp uint))
+(define-private (update-price-history (target-chain-id uint) (price uint) (timestamp uint))
     (let (
         (current-history (default-to
             { last-price: u0, last-update: u0, volatility-index: u0 }
-            (map-get? price-history { chain-id: chain-id })))
+            (map-get? price-history { chain-id: target-chain-id })))
     )
         (map-set price-history
-            { chain-id: chain-id }
+            { chain-id: target-chain-id }
             {
                 last-price: price,
                 last-update: timestamp,
@@ -230,7 +234,8 @@
 (define-private (calculate-volatility (new-price uint) (old-price uint) (current-volatility uint))
     (if (is-eq old-price u0)
         u0
-        (+ (* current-volatility u95) (* (abs (- new-price old-price)) u5))
+        (+ (* current-volatility u95) 
+           (* (calculate-abs-difference new-price old-price) u5))
     )
 )
 
